@@ -34,4 +34,4 @@ jobs:
           SMARTTHINGS_CLIENT_SECRET: ${{ secrets.SMARTTHINGS_CLIENT_SECRET }}
           SMARTTHINGS_REFRESH_TOKEN: ${{ secrets.SMARTTHINGS_REFRESH_TOKEN }}
           SMARTTHINGS_DEVICE_ID: ${{ secrets.SMARTTHINGS_DEVICE_ID }}
-        run: python check_guard.py
+        run: python -u check_guard.py
