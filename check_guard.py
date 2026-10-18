@@ -6,6 +6,21 @@ import base64
 import requests
 from datetime import datetime, timezone, timedelta
 
+# ======================== TIME CONFIGURATION & GATE ========================
+PKT_TZ = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
+
+# 2:00 PM = 14:00 (840 mins), 4:30 PM = 16:30 (990 mins)
+START_MINUTES = 840
+END_MINUTES = 990
+
+now_initial = datetime.now(PKT_TZ)
+current_minute = now_initial.hour * 60 + now_initial.minute
+
+if not (START_MINUTES <= current_minute <= END_MINUTES):
+    print(f"[{now_initial.strftime('%H:%M:%S')} PKT] Outside active window (14:00 - 16:30 PKT).")
+    print("[*] Exiting cleanly without querying Sungrow or SmartThings.")
+    sys.exit(0)
+
 # ======================== CONFIGURATION & SECRETS ========================
 SUNGROW_APP_KEY = os.environ.get("SUNGROW_APP_KEY")
 SUNGROW_APP_SECRET = os.environ.get("SUNGROW_APP_SECRET")
@@ -20,12 +35,9 @@ AC_DEVICE_ID = os.environ.get("SMARTTHINGS_DEVICE_ID")
 
 SUNGROW_BASE_URL = "https://openapi.isolarcloud.com.hk"
 
-# Timing setup
 INTERVAL_SEC = 360    # 6 minutes per poll
 CYCLES_PER_HOUR = 10  # 10 cycles * 6 min = 60 minutes
-PKT_TZ = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
 
-# Verify required variables
 required = [
     SUNGROW_APP_KEY, SUNGROW_APP_SECRET, SUNGROW_USERNAME, SUNGROW_PASSWORD,
     PS_KEY, ST_CLIENT_ID, ST_CLIENT_SECRET, ST_REFRESH_TOKEN, AC_DEVICE_ID
@@ -190,7 +202,6 @@ def get_telemetry():
         try:
             r = requests.post(f"{SUNGROW_BASE_URL}/openapi/getDeviceRealTimeData", json=payload, headers=sungrow_headers, timeout=15)
             res = r.json()
-            # If session expired, re-login and retry
             if res.get("result_code") in ["102", "103", "201"]:
                 print("[!] Sungrow token expired. Re-authenticating...")
                 if login_sungrow():
@@ -204,7 +215,7 @@ def get_telemetry():
         time.sleep(3)
     return None
 
-# ======================== MAIN POLLING LOOP ========================
+# ======================== MAIN EXECUTION ========================
 print("[*] Initializing Sungrow AC Guard...")
 refresh_smartthings_token()
 login_sungrow()
@@ -213,6 +224,13 @@ for cycle in range(1, CYCLES_PER_HOUR + 1):
     now_pkt = datetime.now(PKT_TZ)
     time_minutes = now_pkt.hour * 60 + now_pkt.minute
     now_str = now_pkt.strftime("%H:%M:%S")
+
+    # If the time exceeds the 4:30 PM cutoff during a 1-hour block
+    if time_minutes > END_MINUTES:
+        print(f"[{now_str} PKT] Active afternoon window concluded (> 16:30 PKT). Ensuring AC is OFF and stopping.")
+        ac_state = get_ac_state()
+        set_ac_off(ac_state)
+        break
 
     data_res = get_telemetry()
     ac_state = get_ac_state()
@@ -295,4 +313,4 @@ for cycle in range(1, CYCLES_PER_HOUR + 1):
         print(f" -> Next sample in 6 minutes (360s)...\n")
         time.sleep(INTERVAL_SEC)
 
-print("[+] Completed 1-hour cycle cleanly.")
+print("[+] Completed session cleanly.")
