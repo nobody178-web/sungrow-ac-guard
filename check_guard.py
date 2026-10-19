@@ -7,22 +7,10 @@ import requests
 from datetime import datetime, timezone, timedelta
 from nacl import encoding, public
 
-# ======================== TIME CONFIGURATION & GATE ========================
+# ======================== TIME CONFIGURATION ========================
 PKT_TZ = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
 
-# 2:00 PM = 14:00 (840 mins), 4:30 PM = 16:30 (990 mins)
-START_MINUTES = 840
-END_MINUTES = 990
-
-now_initial = datetime.now(PKT_TZ)
-current_minute = now_initial.hour * 60 + now_initial.minute
-
-if not (START_MINUTES <= current_minute <= END_MINUTES):
-    print(f"[{now_initial.strftime('%H:%M:%S')} PKT] Outside active window (14:00 - 16:30 PKT).")
-    print("[*] Exiting cleanly without querying Sungrow or SmartThings.")
-    sys.exit(0)
-
-# ======================== CONFIGURATION & SECRETS ========================
+# ======================== SECRETS & CREDENTIALS ========================
 SUNGROW_APP_KEY = os.environ.get("SUNGROW_APP_KEY")
 SUNGROW_APP_SECRET = os.environ.get("SUNGROW_APP_SECRET")
 SUNGROW_USERNAME = os.environ.get("SUNGROW_USERNAME")
@@ -35,12 +23,13 @@ ST_REFRESH_TOKEN = os.environ.get("SMARTTHINGS_REFRESH_TOKEN")
 AC_DEVICE_ID = os.environ.get("SMARTTHINGS_DEVICE_ID")
 
 GITHUB_TOKEN = os.environ.get("GH_SECRET_UPDATE_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")  # e.g., "nobody178-web/sungrow-ac-guard"
+GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")  # Injected automatically by GitHub Actions
 
 SUNGROW_BASE_URL = "https://openapi.isolarcloud.com.hk"
 
-INTERVAL_SEC = 360    # 6 minutes per poll
-CYCLES_PER_HOUR = 10  # 10 cycles * 6 min = 60 minutes max per invocation
+# Single-run schedule: 18 cycles * 10 minutes = 3 hours (14:00 to 17:00 PKT)
+INTERVAL_SEC = 600    # 10 minutes per sample
+TOTAL_CYCLES = 18
 
 required = [
     SUNGROW_APP_KEY, SUNGROW_APP_SECRET, SUNGROW_USERNAME, SUNGROW_PASSWORD,
@@ -60,9 +49,9 @@ st_access_token = None
 
 # ======================== GITHUB SECRET ROTATION ========================
 def update_github_secret(new_refresh_token):
-    """Encrypts and pushes the rotated refresh token back to GitHub Secrets."""
+    """Encrypts and pushes rotated refresh token back to GitHub Secrets."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("[!] GITHUB_TOKEN or GITHUB_REPOSITORY missing. Cannot persist rotated secret.")
+        print("[!] GITHUB_TOKEN or GITHUB_REPOSITORY missing. Cannot update rotated secret.")
         return False
 
     gh_headers = {
@@ -70,7 +59,7 @@ def update_github_secret(new_refresh_token):
         "Accept": "application/vnd.github+json"
     }
 
-    # 1. Fetch repository public encryption key
+    # 1. Fetch repository public key for libsodium encryption
     pk_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/public-key"
     r = requests.get(pk_url, headers=gh_headers, timeout=10)
     if r.status_code != 200:
@@ -81,13 +70,13 @@ def update_github_secret(new_refresh_token):
     public_key_b64 = key_data["key"]
     key_id = key_data["key_id"]
 
-    # 2. Encrypt the secret via libsodium sealed box
+    # 2. Encrypt using libsodium SealedBox
     public_key = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
     sealed_box = public.SealedBox(public_key)
     encrypted = sealed_box.encrypt(new_refresh_token.encode("utf-8"))
     encrypted_value = base64.b64encode(encrypted).decode("utf-8")
 
-    # 3. Update SMARTTHINGS_REFRESH_TOKEN repository secret
+    # 3. Update SMARTTHINGS_REFRESH_TOKEN
     put_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/SMARTTHINGS_REFRESH_TOKEN"
     payload = {
         "encrypted_value": encrypted_value,
@@ -268,7 +257,7 @@ def get_telemetry():
         time.sleep(3)
     return None
 
-# ======================== MAIN EXECUTION ========================
+# ======================== MAIN EXECUTION LOOP ========================
 print("[*] Initializing Sungrow AC Guard...")
 if not refresh_smartthings_token():
     print("[-] Fatal: Could not establish SmartThings session. Terminating.")
@@ -278,18 +267,9 @@ if not login_sungrow():
     print("[-] Fatal: Could not establish Sungrow session. Terminating.")
     sys.exit(1)
 
-for cycle in range(1, CYCLES_PER_HOUR + 1):
+for cycle in range(1, TOTAL_CYCLES + 1):
     now_pkt = datetime.now(PKT_TZ)
-    time_minutes = now_pkt.hour * 60 + now_pkt.minute
     now_str = now_pkt.strftime("%H:%M:%S")
-
-    # Hard boundary at 4:30 PM (990 mins)
-    if time_minutes >= END_MINUTES:
-        print(f"[{now_str} PKT] Active afternoon window concluded (>= 16:30 PKT). Ensuring AC is OFF.")
-        ac_state = get_ac_state()
-        set_ac_off(ac_state)
-        print("[*] Day cutoff reached. Halting script execution.")
-        sys.exit(0)
 
     data_res = get_telemetry()
     ac_state = get_ac_state()
@@ -316,64 +296,52 @@ for cycle in range(1, CYCLES_PER_HOUR + 1):
 
         ac_status_str = f"{ac_state['power'].upper()} ({ac_state['mode']} @ {ac_state['setpoint']}°C, {ac_state['fanMode']})" if ac_state else "UNKNOWN"
 
-        print(f"[{now_str} PKT] Cycle {cycle}/{CYCLES_PER_HOUR} | "
+        print(f"[{now_str} PKT] Cycle {cycle}/{TOTAL_CYCLES} | "
               f"SOC: {soc:.1f}% | PV: {pv_w:.0f}W | Load: {load_w:.0f}W | Discharge: {discharge_w:.0f}W | "
               f"AC: {ac_status_str}")
 
-        # ======================= ORIGINAL DECISION ENGINE =======================
+        # ======================= STATE MACHINE ENGINE =======================
         target_action = "LEAVE_AS_IS"
         reason = ""
 
-        # Condition 1: Evening Cutoff (After 4:30 PM [990 mins] or PV < 300W)
-        if time_minutes >= 990 or pv_w < 300.0:
+        # Condition 1: Solar production collapse (Sunset cutoff)
+        if pv_w < 250.0:
             target_action = "SET_OFF"
-            reason = f"Evening/Sunset cutoff (Time >= 16:30 or PV < 300W [Current: {pv_w:.0f}W])"
+            reason = f"Solar PV collapsed ({pv_w:.0f}W < 250W). Sunset shutdown."
 
-        # Condition 2: Window 3:00 PM to 4:30 PM (900 <= time < 990 mins)
-        elif 900 <= time_minutes < 990:
-            if soc < 95.0:
-                target_action = "SET_OFF"
-                reason = f"SOC {soc:.1f}% is < 95% after 3 PM. Off to prioritize battery charge."
-            else:
-                if pv_w >= load_w and discharge_w <= 100.0:
-                    target_action = "SET_ECO"
-                    reason = f"SOC >= 95% with Solar Surplus (PV {pv_w:.0f}W >= Load {load_w:.0f}W). ECO enabled."
-                else:
-                    target_action = "SET_OFF"
-                    reason = f"SOC >= 95% but Solar Deficit (Discharge {discharge_w:.0f}W > 100W or PV < Load). Turning OFF."
+        # Condition 2: Primary Reserve Floor (Hard shutdown point)
+        elif soc < 88.0:
+            target_action = "SET_OFF"
+            reason = f"Battery SOC {soc:.1f}% dropped below 88% reserve floor. Shutting down AC."
 
-        # Condition 3: Window 2:00 PM to 3:00 PM (840 <= time < 900 mins)
-        elif 840 <= time_minutes < 900:
-            if soc < 90.0 and discharge_w > 500.0:
-                target_action = "SET_ECO"
-                reason = f"SOC {soc:.1f}% < 90% AND Discharge {discharge_w:.0f}W > 500W. Throttling to ECO (26°C)."
-            else:
-                target_action = "LEAVE_AS_IS"
-                reason = "Safe operating range (SOC >= 90% or Discharge <= 500W). Leaving AC untouched."
+        # Condition 3: Real deficit past the BMS 95% recharge deadband
+        elif soc < 92.0 and discharge_w > 400.0:
+            target_action = "SET_ECO"
+            reason = f"SOC {soc:.1f}% < 92% and Discharge {discharge_w:.0f}W > 400W. Throttling to ECO (26°C, Low Fan)."
 
-        # Condition 4: Before 2:00 PM (time < 840 mins)
+        # Condition 4: Healthy state (Full pack or solar covering load)
         else:
             target_action = "LEAVE_AS_IS"
-            reason = "Before 2:00 PM generation window. Leaving AC untouched."
+            reason = f"Normal operation (SOC: {soc:.1f}%, Discharge: {discharge_w:.0f}W). Preserving comfort."
 
-        # ======================= DISPATCHER & IMMEDIATE HALT =======================
+        # ======================= DISPATCH & IMMEDIATE HALT =======================
         print(f" -> Decision: {target_action} | Reason: {reason}")
 
         if target_action == "SET_OFF":
             ok, msg = set_ac_off(ac_state)
             print(f"    [Action OFF] {msg}")
             print("[*] Shutdown condition reached. Halting script execution immediately for the day.")
-            sys.exit(0)
+            sys.exit(0)  # Halts workflow immediately; will not resume until tomorrow's cron
 
         elif target_action == "SET_ECO":
             ok, msg = set_ac_eco(ac_state)
             print(f"    [Action ECO] {msg}")
 
         elif target_action == "LEAVE_AS_IS":
-            print("    [Action] No command sent. Current AC state preserved.")
+            print("    [Action] Current AC state preserved.")
 
-    if cycle < CYCLES_PER_HOUR:
-        print(f" -> Next sample in 6 minutes (360s)...\n")
+    if cycle < TOTAL_CYCLES:
+        print(f" -> Next sample in 10 minutes (600s)...\n")
         time.sleep(INTERVAL_SEC)
 
-print("[+] Completed session cleanly.")
+print("[+] Completed 3-hour monitoring window cleanly.")
