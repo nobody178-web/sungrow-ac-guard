@@ -1,12 +1,7 @@
 name: Sungrow AC Afternoon Guard (2:00 PM - 4:30 PM PKT)
 
 on:
-  schedule:
-    # 09:00 UTC = 2:00 PM PKT
-    # 10:00 UTC = 3:00 PM PKT
-    # 11:00 UTC = 4:00 PM PKT (covers 4:00 PM - 4:30 PM and evening shutoff)
-    - cron: '0 9,10,11 * * *'
-  workflow_dispatch: # Allows manual trigger from the GitHub web UI
+  workflow_dispatch:
 
 jobs:
   run-guard:
@@ -21,10 +16,11 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests pynacl
 
       - name: Run 6-Minute Battery Guard
         env:
+          PYTHONUNBUFFERED: "1"
           SUNGROW_APP_KEY: ${{ secrets.SUNGROW_APP_KEY }}
           SUNGROW_APP_SECRET: ${{ secrets.SUNGROW_APP_SECRET }}
           SUNGROW_USERNAME: ${{ secrets.SUNGROW_USERNAME }}
@@ -34,4 +30,5 @@ jobs:
           SMARTTHINGS_CLIENT_SECRET: ${{ secrets.SMARTTHINGS_CLIENT_SECRET }}
           SMARTTHINGS_REFRESH_TOKEN: ${{ secrets.SMARTTHINGS_REFRESH_TOKEN }}
           SMARTTHINGS_DEVICE_ID: ${{ secrets.SMARTTHINGS_DEVICE_ID }}
+          GH_SECRET_UPDATE_TOKEN: ${{ secrets.GH_PAT_SECRET_ADMIN }}
         run: python -u check_guard.py
