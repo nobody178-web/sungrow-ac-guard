@@ -5,6 +5,7 @@ import time
 import base64
 import requests
 from datetime import datetime, timezone, timedelta
+from nacl import encoding, public
 
 # ======================== TIME CONFIGURATION & GATE ========================
 PKT_TZ = timezone(timedelta(hours=5))  # Pakistan Standard Time (UTC+5)
@@ -33,10 +34,13 @@ ST_CLIENT_SECRET = os.environ.get("SMARTTHINGS_CLIENT_SECRET")
 ST_REFRESH_TOKEN = os.environ.get("SMARTTHINGS_REFRESH_TOKEN")
 AC_DEVICE_ID = os.environ.get("SMARTTHINGS_DEVICE_ID")
 
+GITHUB_TOKEN = os.environ.get("GH_SECRET_UPDATE_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPOSITORY")  # e.g., "nobody178-web/sungrow-ac-guard"
+
 SUNGROW_BASE_URL = "https://openapi.isolarcloud.com.hk"
 
 INTERVAL_SEC = 360    # 6 minutes per poll
-CYCLES_PER_HOUR = 10  # 10 cycles * 6 min = 60 minutes
+CYCLES_PER_HOUR = 10  # 10 cycles * 6 min = 60 minutes max per invocation
 
 required = [
     SUNGROW_APP_KEY, SUNGROW_APP_SECRET, SUNGROW_USERNAME, SUNGROW_PASSWORD,
@@ -52,12 +56,55 @@ sungrow_headers = {
     "x-access-key": SUNGROW_APP_SECRET
 }
 
-# ======================== SMARTTHINGS ADAPTER ========================
 st_access_token = None
 
+# ======================== GITHUB SECRET ROTATION ========================
+def update_github_secret(new_refresh_token):
+    """Encrypts and pushes the rotated refresh token back to GitHub Secrets."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("[!] GITHUB_TOKEN or GITHUB_REPOSITORY missing. Cannot persist rotated secret.")
+        return False
+
+    gh_headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    # 1. Fetch repository public encryption key
+    pk_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/public-key"
+    r = requests.get(pk_url, headers=gh_headers, timeout=10)
+    if r.status_code != 200:
+        print(f"[!] Failed to fetch GitHub repo public key: {r.status_code} - {r.text}")
+        return False
+
+    key_data = r.json()
+    public_key_b64 = key_data["key"]
+    key_id = key_data["key_id"]
+
+    # 2. Encrypt the secret via libsodium sealed box
+    public_key = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = public.SealedBox(public_key)
+    encrypted = sealed_box.encrypt(new_refresh_token.encode("utf-8"))
+    encrypted_value = base64.b64encode(encrypted).decode("utf-8")
+
+    # 3. Update SMARTTHINGS_REFRESH_TOKEN repository secret
+    put_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/secrets/SMARTTHINGS_REFRESH_TOKEN"
+    payload = {
+        "encrypted_value": encrypted_value,
+        "key_id": key_id
+    }
+    put_r = requests.put(put_url, headers=gh_headers, json=payload, timeout=10)
+    if put_r.status_code in [201, 204]:
+        print("[+] Successfully rotated and updated SMARTTHINGS_REFRESH_TOKEN in GitHub Secrets.")
+        return True
+    else:
+        print(f"[!] GitHub Secret update failed: {put_r.status_code} - {put_r.text}")
+        return False
+
+# ======================== SMARTTHINGS ADAPTER ========================
 def refresh_smartthings_token():
-    """Generates a fresh 24h SmartThings access token using OAuth refresh token."""
-    global st_access_token
+    """Exchanges refresh token for access token and rotates the stored refresh token."""
+    global st_access_token, ST_REFRESH_TOKEN
     url = "https://api.smartthings.com/oauth/token"
     auth_header = base64.b64encode(f"{ST_CLIENT_ID}:{ST_CLIENT_SECRET}".encode()).decode()
     headers = {
@@ -73,8 +120,14 @@ def refresh_smartthings_token():
         try:
             res = requests.post(url, headers=headers, data=data, timeout=15)
             if res.status_code == 200:
-                st_access_token = res.json().get("access_token")
-                print(f"[+] SmartThings token refreshed successfully (Attempt {attempt}).")
+                resp_json = res.json()
+                st_access_token = resp_json.get("access_token")
+                new_refresh = resp_json.get("refresh_token")
+                print(f"[+] SmartThings OAuth refreshed successfully.")
+
+                if new_refresh and new_refresh != ST_REFRESH_TOKEN:
+                    ST_REFRESH_TOKEN = new_refresh
+                    update_github_secret(new_refresh)
                 return True
             print(f"[!] SmartThings refresh rejected (Code {res.status_code}): {res.text}")
         except Exception as e:
@@ -90,7 +143,7 @@ def get_ac_state():
 
     url = f"https://api.smartthings.com/v1/devices/{AC_DEVICE_ID}/status"
     headers = {"Authorization": f"Bearer {st_access_token}", "Content-Type": "application/json"}
-    
+
     for attempt in range(1, 4):
         try:
             r = requests.get(url, headers=headers, timeout=12)
@@ -217,20 +270,26 @@ def get_telemetry():
 
 # ======================== MAIN EXECUTION ========================
 print("[*] Initializing Sungrow AC Guard...")
-refresh_smartthings_token()
-login_sungrow()
+if not refresh_smartthings_token():
+    print("[-] Fatal: Could not establish SmartThings session. Terminating.")
+    sys.exit(1)
+
+if not login_sungrow():
+    print("[-] Fatal: Could not establish Sungrow session. Terminating.")
+    sys.exit(1)
 
 for cycle in range(1, CYCLES_PER_HOUR + 1):
     now_pkt = datetime.now(PKT_TZ)
     time_minutes = now_pkt.hour * 60 + now_pkt.minute
     now_str = now_pkt.strftime("%H:%M:%S")
 
-    # If the time exceeds the 4:30 PM cutoff during a 1-hour block
-    if time_minutes > END_MINUTES:
-        print(f"[{now_str} PKT] Active afternoon window concluded (> 16:30 PKT). Ensuring AC is OFF and stopping.")
+    # Hard boundary at 4:30 PM (990 mins)
+    if time_minutes >= END_MINUTES:
+        print(f"[{now_str} PKT] Active afternoon window concluded (>= 16:30 PKT). Ensuring AC is OFF.")
         ac_state = get_ac_state()
         set_ac_off(ac_state)
-        break
+        print("[*] Day cutoff reached. Halting script execution.")
+        sys.exit(0)
 
     data_res = get_telemetry()
     ac_state = get_ac_state()
@@ -261,7 +320,7 @@ for cycle in range(1, CYCLES_PER_HOUR + 1):
               f"SOC: {soc:.1f}% | PV: {pv_w:.0f}W | Load: {load_w:.0f}W | Discharge: {discharge_w:.0f}W | "
               f"AC: {ac_status_str}")
 
-        # ======================= DECISION ENGINE =======================
+        # ======================= ORIGINAL DECISION ENGINE =======================
         target_action = "LEAVE_AS_IS"
         reason = ""
 
@@ -297,15 +356,19 @@ for cycle in range(1, CYCLES_PER_HOUR + 1):
             target_action = "LEAVE_AS_IS"
             reason = "Before 2:00 PM generation window. Leaving AC untouched."
 
-        # ======================= DISPATCHER =======================
+        # ======================= DISPATCHER & IMMEDIATE HALT =======================
         print(f" -> Decision: {target_action} | Reason: {reason}")
 
         if target_action == "SET_OFF":
             ok, msg = set_ac_off(ac_state)
             print(f"    [Action OFF] {msg}")
+            print("[*] Shutdown condition reached. Halting script execution immediately for the day.")
+            sys.exit(0)
+
         elif target_action == "SET_ECO":
             ok, msg = set_ac_eco(ac_state)
             print(f"    [Action ECO] {msg}")
+
         elif target_action == "LEAVE_AS_IS":
             print("    [Action] No command sent. Current AC state preserved.")
 
