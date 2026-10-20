@@ -227,7 +227,7 @@ def login_sungrow():
     return False
 
 def get_telemetry():
-    """Reads live telemetry registers with session renewal."""
+    """Reads live telemetry registers with robust session renewal."""
     global sungrow_token
     if not sungrow_token and not login_sungrow():
         return None
@@ -244,13 +244,20 @@ def get_telemetry():
         try:
             r = requests.post(f"{SUNGROW_BASE_URL}/openapi/getDeviceRealTimeData", json=payload, headers=sungrow_headers, timeout=15)
             res = r.json()
-            if res.get("result_code") in ["102", "103", "201"]:
-                print("[!] Sungrow token expired. Re-authenticating...")
+            
+            result_code = str(res.get("result_code", ""))
+            result_msg = str(res.get("result_msg", "")).lower()
+
+            # Catch er_token_login_invalid and all known expired token codes
+            if result_code in ["102", "103", "104", "201", "203"] or "token" in result_msg or "invalid" in result_msg:
+                print(f"[!] Sungrow token expired ({res.get('result_msg')}). Re-authenticating...")
                 if login_sungrow():
                     payload["token"] = sungrow_token
-                    continue
-            if res.get("result_code") == "1":
+                    continue  # Retry with the fresh token immediately
+            
+            if result_code == "1":
                 return res
+            
             print(f"[!] Sungrow telemetry response error: {res.get('result_msg')}")
         except Exception as e:
             print(f"[!] Sungrow connection failure ({attempt}/3): {e}")
